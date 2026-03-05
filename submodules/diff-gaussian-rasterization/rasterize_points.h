@@ -38,7 +38,7 @@ LiteRasterizeGaussiansCUDA(
 	const bool argmax_depth);
 	
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-	torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+	torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -48,6 +48,8 @@ RasterizeGaussiansCUDA(
     const torch::Tensor& albedo,
     const torch::Tensor& roughness,
     const torch::Tensor& metallic,
+	const torch::Tensor& feature,
+	const int feature_dim,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const torch::Tensor& cov3D_precomp,
@@ -67,7 +69,7 @@ RasterizeGaussiansCUDA(
 	const bool debug);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-	torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+	torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -77,6 +79,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& albedo,
     const torch::Tensor& roughness,
     const torch::Tensor& metallic,
+	const torch::Tensor& feature,
+	const int feature_dim,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const torch::Tensor& cov3D_precomp,
@@ -95,6 +99,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& dL_dout_albedo,
     const torch::Tensor& dL_dout_roughness,
     const torch::Tensor& dL_dout_metallic,
+	const torch::Tensor& dL_dout_feature,
 	const torch::Tensor& geomBuffer,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,

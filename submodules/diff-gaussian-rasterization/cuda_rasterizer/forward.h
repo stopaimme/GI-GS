@@ -103,6 +103,17 @@ namespace FORWARD
 		float* out_metallic,
 		const bool argmax_depth,
 		const bool inference);
+
+	void render_feature(
+		const dim3 grid, dim3 block,
+		const int W, int H,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		const float* features,
+		const float2* points_xy_image,
+		const float4* conic_opacity,
+		const int feature_dim,
+		float* out_feature);
 	
 	void depthToNormal(
 		const dim3 grid,

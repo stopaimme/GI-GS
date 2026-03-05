@@ -498,6 +498,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* albedo,			// [P, 3]
 	const float* roughness,			// [P, 1]
 	const float* metallic,			// [P, 1]
+	const float* feature,			// [P, F]
+	const int feature_dim,
 	const float* scales,			// [P, 3]
 	const float scale_modifier,
 	const float* rotations,			// [P, 4]
@@ -518,6 +520,7 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_albedo,		// [3, H, W]
 	float* out_roughness,	// [1, H, W]
 	float* out_metallic,	// [1, H, W]
+	float* out_feature,	// [F, H, W]
 	int* radii,				// [P]
 	bool debug)
 {
@@ -668,6 +671,19 @@ int CudaRasterizer::Rasterizer::forward(
 		argmax_depth,
 		inference), debug)
 
+	if (feature_dim > 0) {
+		CHECK_CUDA(FORWARD::render_feature(
+			tile_grid, block,
+			width, height,
+			imgState.ranges,
+			binningState.point_list,
+			feature,
+			geomState.means2D,
+			geomState.conic_opacity,
+			feature_dim,
+			out_feature), debug)
+	}
+
 	return num_rendered;
 }
 
@@ -684,6 +700,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* albedo,
 	const float* roughness,
 	const float* metallic,
+	const float* feature,
+	const int feature_dim,
 	const float* scales,
 	const float* rotations,
 	const float* cov3D_precomp,
@@ -703,6 +721,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* dL_dpix_albedo,
 	const float* dL_dpix_roughness,
 	const float* dL_dpix_metallic,
+	const float* dL_dpix_feature,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_depth,
@@ -711,6 +730,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dalbedo,
 	float* dL_droughness,
 	float* dL_dmetallic,
+	float* dL_dfeature,
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
@@ -772,6 +792,21 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dalbedo,
 		dL_droughness,
 		dL_dmetallic), debug)
+
+	if (feature_dim > 0) {
+		CHECK_CUDA(BACKWARD::render_feature(
+			tile_grid,
+			block,
+			width,
+			height,
+			imgState.ranges,
+			binningState.point_list,
+			geomState.means2D,
+			geomState.conic_opacity,
+			dL_dpix_feature,
+			feature_dim,
+			dL_dfeature), debug)
+	}
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

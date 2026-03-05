@@ -807,6 +807,102 @@ SSRCUDA(
     // color[2 * H * W + pix_id] = diffuse.z + specular.z * (1.0 / float(nrSamples));	
 }
 
+
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderFeatureBackwardCUDA(
+	const int W, int H,
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ dL_dpixels_feature,
+	const int feature_dim,
+	float* __restrict__ dL_dfeature)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	float T = 1.0f;
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y) {
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f) {
+				done = true;
+				continue;
+			}
+			const float weight = alpha * T;
+			const int point_offset = collected_id[j] * feature_dim;
+			if (inside) {
+				for (int feat_ch = 0; feat_ch < feature_dim; ++feat_ch) {
+					const float dL_dpixel = dL_dpixels_feature[feat_ch * H * W + pix_id];
+					atomicAdd(&(dL_dfeature[point_offset + feat_ch]), weight * dL_dpixel);
+				}
+			}
+			T = test_T;
+		}
+	}
+}
+
+void BACKWARD::render_feature(
+	const dim3 grid, const dim3 block,
+	const int W, int H,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	const float2* means2D,
+	const float4* conic_opacity,
+	const float* dL_dpixels_feature,
+	const int feature_dim,
+	float* dL_dfeature)
+{
+	renderFeatureBackwardCUDA<<<grid, block>>>(
+		W, H,
+		ranges,
+		point_list,
+		means2D,
+		conic_opacity,
+		dL_dpixels_feature,
+		feature_dim,
+		dL_dfeature
+	);
+}
+
 void BACKWARD::preprocess(
 	const int P, int D, int M,
 	const float focal_x, float focal_y,
