@@ -102,7 +102,12 @@ namespace FORWARD
 		float* out_roughness,
 		float* out_metallic,
 		const bool argmax_depth,
-		const bool inference);
+		const bool inference,
+		const uint32_t* bucket_offsets,
+		uint32_t* bucket_to_tile,
+		float* sampled_T,
+		float* sampled_ar,
+		uint32_t* max_contrib);
 
 	void render_feature(
 		const dim3 grid, dim3 block,

@@ -452,7 +452,12 @@ renderCUDA(
 	float* __restrict__ out_roughness,
 	float* __restrict__ out_metallic,
 	bool argmax_depth,
-	bool inference)
+	bool inference,
+	const uint32_t* __restrict__ bucket_offsets,
+	uint32_t* __restrict__ bucket_to_tile,
+	float* __restrict__ sampled_T,
+	float* __restrict__ sampled_ar,
+	uint32_t* __restrict__ max_contrib)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -471,9 +476,14 @@ renderCUDA(
 	bool done = !inside;
 
 	// Load start/end range of IDs to process in bit sorted list.
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const uint32_t tile_id = block.group_index().y * horizontal_blocks + block.group_index().x;
+	uint2 range = ranges[tile_id];
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 	int toDo = range.y - range.x;
+
+	// Compute bucket base for this tile
+	const uint32_t bbm_base = (tile_id == 0) ? 0 : bucket_offsets[tile_id - 1];
+	const uint32_t thread_rank = block.thread_rank();
 
 	// Allocate storage for batches of collectively fetched data.
 	__shared__ int collected_id[BLOCK_SIZE];
@@ -498,6 +508,8 @@ renderCUDA(
 	float except_depth = 0.0f;
 	float3 except_pos = {0.0f, 0.0f, 0.0f};
 
+	// Global splat counter within the tile (across all rounds)
+	uint32_t global_splat_idx = 0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -521,10 +533,26 @@ renderCUDA(
 		// Iterate over current batch
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
+			// ★ Every 32 splats, save a snapshot for bucket-centric backward
+			if (global_splat_idx % 32 == 0) {
+				uint32_t bucket_idx = bbm_base + global_splat_idx / 32;
+				// First thread in block writes bucket_to_tile mapping
+				if (thread_rank == 0) {
+					bucket_to_tile[bucket_idx] = tile_id;
+				}
+				// All threads save their T and accumulated color state
+				uint32_t snap_base = bucket_idx * BLOCK_SIZE + thread_rank;
+				sampled_T[snap_base] = T;
+				for (int ch = 0; ch < CHANNELS; ch++) {
+					sampled_ar[bucket_idx * BLOCK_SIZE * CHANNELS + ch * BLOCK_SIZE + thread_rank] = C[ch];
+				}
+			}
+			global_splat_idx++;
+
 			// Keep track of current position in range
 			contributor++;
 
-			// Resample using conic matrix (cf. "Surface 
+			// Resample using conic matrix (cf. "Surface
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
@@ -536,7 +564,7 @@ renderCUDA(
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
+			// Avoid numerical instabilities (see paper appendix).
 			float alpha = min(0.99f, con_o.w * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
@@ -597,13 +625,16 @@ renderCUDA(
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 
+		// Write per-tile max_contrib (atomicMax across all pixels in tile)
+		atomicMax(&max_contrib[tile_id], last_contributor);
+
 		N_world = {N[0], N[1], N[2]};
 		N_view = transformVec4x3(N_world, viewmatrix);
 		N_view = normalize(N_view);
 		out_normal_view[pix_id] = N_view.x;
 		out_normal_view[1 * H * W + pix_id] = N_view.y;
 		out_normal_view[2 * H * W + pix_id] = N_view.z;
-		
+
 		for (int ch = 0; ch < CHANNELS; ch++) {
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 			out_normal[ch * H * W + pix_id] = N[ch];
@@ -626,7 +657,7 @@ renderCUDA(
 			out_pos[1 * H * W + pix_id] = 0.0f;
 			out_pos[2 * H * W + pix_id] = 0.0f;
 		}
-		
+
 
 		out_opacity[pix_id] = O;
 	}
@@ -1196,7 +1227,12 @@ void FORWARD::render(
 	float* out_roughness,
 	float* out_metallic,
 	const bool argmax_depth,
-	const bool inference)
+	const bool inference,
+	const uint32_t* bucket_offsets,
+	uint32_t* bucket_to_tile,
+	float* sampled_T,
+	float* sampled_ar,
+	uint32_t* max_contrib)
 {
 	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
 		W, H,
@@ -1222,13 +1258,18 @@ void FORWARD::render(
 		out_opacity,
 		out_depth,
 		out_normal,
-		out_normal_view, 
+		out_normal_view,
 		out_pos,
 		out_albedo,
 		out_roughness,
 		out_metallic,
 		argmax_depth,
-		inference);
+		inference,
+		bucket_offsets,
+		bucket_to_tile,
+		sampled_T,
+		sampled_ar,
+		max_contrib);
 }
 
 void FORWARD::preprocess(

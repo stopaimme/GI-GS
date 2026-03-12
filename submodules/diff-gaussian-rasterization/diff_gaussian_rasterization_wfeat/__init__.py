@@ -126,6 +126,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                     geomBuffer,
                     binningBuffer,
                     imgBuffer,
+                    sampleBuffer,
                     opacity_map,
                     depth,
                     out_normal,
@@ -150,6 +151,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 geomBuffer,
                 binningBuffer,
                 imgBuffer,
+                sampleBuffer,
                 opacity_map,
                 depth,
                 out_normal,
@@ -180,6 +182,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             geomBuffer,
             binningBuffer,
             imgBuffer,
+            sampleBuffer,
         )
         return (
             color,
@@ -244,6 +247,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             geomBuffer,
             binningBuffer,
             imgBuffer,
+            sampleBuffer,
         ) = ctx.saved_tensors
 
        
@@ -283,6 +287,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             geomBuffer,
             binningBuffer,
             imgBuffer,
+            sampleBuffer,
             num_rendered,
             raster_settings.debug,
         )

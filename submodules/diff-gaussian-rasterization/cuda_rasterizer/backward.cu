@@ -400,10 +400,14 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-// Backward version of the rendering procedure.
+// Bucket-centric backward version of the rendering procedure.
+// Each CUDA block processes multiple buckets (groups of 32 splats).
+// For each bucket, we iterate over all BLOCK_SIZE pixels of the
+// corresponding tile, restoring state from forward snapshots.
 template <uint32_t C>
-__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderCUDA(
+__global__ void
+renderBucketCUDA(
+	const int total_buckets,
 	const int W, int H,
 	const float* means3D,
 	const float* cam_pos,
@@ -419,6 +423,11 @@ renderCUDA(
 	const float* __restrict__ metallic,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
+	const uint32_t* __restrict__ bucket_to_tile,
+	const uint32_t* __restrict__ bucket_offsets,
+	const float* __restrict__ sampled_T,
+	const float* __restrict__ sampled_ar,
+	const uint32_t* __restrict__ max_contrib,
 	const float* __restrict__ dL_dpixels_depth,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixels_opacity,
@@ -436,107 +445,99 @@ renderCUDA(
 	float* __restrict__ dL_droughness,
 	float* __restrict__ dL_dmetallic)
 {
-	// We rasterize again. Compute necessary block info.
-	auto block = cg::this_thread_block();
+	// Each thread in this block handles one bucket, iterating over all pixels
+	const int bucket_idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (bucket_idx >= total_buckets)
+		return;
+
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	const uint32_t pix_id = W * pix.y + pix.x;
-	const float2 pixf = { (float)pix.x, (float)pix.y };
+	const uint32_t tile_id = bucket_to_tile[bucket_idx];
+	const uint32_t tile_bucket_base = (tile_id == 0) ? 0 : bucket_offsets[tile_id - 1];
+	const uint32_t bucket_in_tile = bucket_idx - tile_bucket_base;
 
-	const bool inside = pix.x < W && pix.y < H;
-	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	// Early stop: if this bucket is beyond the last contributor for the tile
+	if (bucket_in_tile * 32 >= max_contrib[tile_id])
+		return;
 
-	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	const uint2 range = ranges[tile_id];
+	const uint32_t splat_start = range.x + bucket_in_tile * 32;
+	const uint32_t splat_end = min(splat_start + 32u, range.y);
 
-	bool done = !inside;
-	int toDo = range.y - range.x;
+	// Compute tile pixel coordinates
+	const uint32_t tile_x = tile_id % horizontal_blocks;
+	const uint32_t tile_y = tile_id / horizontal_blocks;
+	const uint2 pix_min = { tile_x * BLOCK_X, tile_y * BLOCK_Y };
 
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-	__shared__ float collected_colors[C * BLOCK_SIZE];
+	// Gradient of pixel coordinate w.r.t. normalized screen-space viewport
+	const float ddelx_dx = 0.5f * W;
+	const float ddely_dy = 0.5f * H;
 
-	// In the forward, we stored the final value for T, the
-	// product of all (1 - alpha) factors. 
-	const float T_final = inside ? final_Ts[pix_id] : 0;
-	float T = T_final;
-
-	// We start from the back. The ID of the last contributing
-	// Gaussian is known from each pixel from the forward.
-	uint32_t contributor = toDo;
-	const int last_contributor = inside ? n_contrib[pix_id] : 0;
-
-	float last_alpha = 0.0f;
-
-	float accum_opacity = 0.0f;
-	float accum_rec[C] = { 0.0f };
-	float dL_dpixel[C];
-	float dL_dpixel_opacity;
-	// NOTE: PBR
-	float dL_dpixel_normal[C];
-	float dL_dpixel_albedo[C];
-	float dL_dpixel_roughness;
-	float dL_dpixel_metallic;
-	float dL_dpixel_depth;
-	if (inside) {
-		for (int i = 0; i < C; i++) {
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
-			dL_dpixel_normal[i] = dL_dpixels_normal[i * H * W + pix_id];
-			dL_dpixel_albedo[i] = dL_dpixels_albedo[i * H * W + pix_id];
-		}
-		dL_dpixel_opacity = dL_dpixels_opacity[pix_id];
-		dL_dpixel_roughness = dL_dpixels_roughness[pix_id];
-		dL_dpixel_metallic = dL_dpixels_metallic[pix_id];
-		dL_dpixel_depth = dL_dpixels_depth[pix_id];
-	}
-	float last_color[C] = { 0.0f };
-	
-	// Skip the edge normal
-	if (pix.x == 0 || pix.x == W - 1 || pix.y == 0 || pix.y == H - 1) {
-		for (int i = 0; i < C; i++) {
-			dL_dpixel_normal[i] = 0.0f;
-		}
-	}
-
-	// Gradient of pixel coordinate w.r.t. normalized 
-	// screen-space viewport corrdinates (-1 to 1)
-	const float ddelx_dx = 0.5 * W;
-	const float ddely_dy = 0.5 * H;
-
-	// Traverse all Gaussians
-	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	// Iterate over all pixels in the tile
+	for (int pixel_local = 0; pixel_local < BLOCK_SIZE; pixel_local++)
 	{
-		// Load auxiliary data into shared memory, start in the BACK
-		// and load them in revers order.
-		block.sync();
-		const int progress = i * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y)
-		{
-			const int coll_id = point_list[range.y - progress - 1];
-			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			for (int i = 0; i < C; i++) {
-				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+		const uint32_t local_x = pixel_local % BLOCK_X;
+		const uint32_t local_y = pixel_local / BLOCK_X;
+		const uint2 pix = { pix_min.x + local_x, pix_min.y + local_y };
+
+		if (pix.x >= (uint32_t)W || pix.y >= (uint32_t)H)
+			continue;
+
+		const uint32_t pix_id = W * pix.y + pix.x;
+		const float2 pixf = { (float)pix.x, (float)pix.y };
+
+		// Per-pixel last_contributor check
+		const uint32_t last_contributor = n_contrib[pix_id];
+		// The contributor index for the first splat in this bucket
+		const uint32_t bucket_start_contributor = bucket_in_tile * 32 + 1;
+		if (bucket_start_contributor > last_contributor)
+			continue;
+
+		// Restore state from forward snapshot
+		const uint32_t snap_base = bucket_idx * BLOCK_SIZE + pixel_local;
+		float T = sampled_T[snap_base];
+		float accum_rec[C];
+		for (int ch = 0; ch < C; ch++) {
+			accum_rec[ch] = sampled_ar[bucket_idx * BLOCK_SIZE * C + ch * BLOCK_SIZE + pixel_local];
+		}
+
+		const float T_final = final_Ts[pix_id];
+
+		// Load per-pixel gradient targets
+		float dL_dpixel[C];
+		float dL_dpixel_normal[C];
+		float dL_dpixel_albedo[C];
+		for (int ch = 0; ch < C; ch++) {
+			dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
+			dL_dpixel_normal[ch] = dL_dpixels_normal[ch * H * W + pix_id];
+			dL_dpixel_albedo[ch] = dL_dpixels_albedo[ch * H * W + pix_id];
+		}
+		float dL_dpixel_opacity = dL_dpixels_opacity[pix_id];
+		float dL_dpixel_roughness = dL_dpixels_roughness[pix_id];
+		float dL_dpixel_metallic = dL_dpixels_metallic[pix_id];
+		float dL_dpixel_depth = dL_dpixels_depth[pix_id];
+
+		// Skip the edge normal
+		if (pix.x == 0 || pix.x == (uint32_t)(W - 1) || pix.y == 0 || pix.y == (uint32_t)(H - 1)) {
+			for (int ch = 0; ch < C; ch++) {
+				dL_dpixel_normal[ch] = 0.0f;
 			}
 		}
-		block.sync();
 
-		// Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		// Forward-traverse through the 32 splats of this bucket
+		// to compute gradients (same math as original backward, but forward order)
+		for (uint32_t s = splat_start; s < splat_end; s++)
 		{
-			// Keep track of current Gaussian ID. Skip, if this one
-			// is behind the last contributor for this pixel.
-			contributor--;
-			if (contributor >= last_contributor)
-				continue;
+			// The contributor index (1-based) for this splat
+			const uint32_t contributor = (s - range.x) + 1;
+			if (contributor > last_contributor)
+				break;
 
-			// Compute blending values, as before.
-			const float2 xy = collected_xy[j];
+			const int global_id = point_list[s];
+
+			// Compute blending values
+			const float2 xy = points_xy_image[global_id];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			const float4 con_o = collected_conic_opacity[j];
+			const float4 con_o = conic_opacity[global_id];
 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
@@ -546,62 +547,44 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
-			T = T / (1.f - alpha);
+			float test_T = T * (1.f - alpha);
+			if (test_T < 0.0001f)
+				break;
+
 			const float dchannel_dcolor = alpha * T;
 
-			float3 view_dir = {
-				cam_pos[0] - means3D[collected_id[j] * 3 + 0],
-				cam_pos[1] - means3D[collected_id[j] * 3 + 1],
-				cam_pos[2] - means3D[collected_id[j] * 3 + 2],
-			};
-			const float NoV = normals[collected_id[j] * 3 + 0] * view_dir.x + \
-							  normals[collected_id[j] * 3 + 1] * view_dir.y + \
-							  normals[collected_id[j] * 3 + 2] * view_dir.z;
-
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
+			// Compute dL_dalpha
 			float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
-
+				const float c = colors[global_id * C + ch];
 				const float dL_dchannel = dL_dpixel[ch];
+				// (c - accum_rec[ch]) is the "remainder" term
 				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
+				// Gradient w.r.t. color
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
-
-				// NOTE: PBR (do not contribute to the alpha/opacity)
-                //if (NoV > 0.0f) { // NOTE: the trick from GIR, do not make scene for scenes
-					const float dL_dchannel_normal = dL_dpixel_normal[ch];
-					atomicAdd(&(dL_dnormals[global_id * C + ch]), dchannel_dcolor * dL_dchannel_normal);
-				//}
-				const float dL_dchannel_albedo = dL_dpixel_albedo[ch];
-				atomicAdd(&(dL_dalbedo[global_id * C + ch]), dchannel_dcolor * dL_dchannel_albedo);
+				// PBR normals
+				atomicAdd(&(dL_dnormals[global_id * C + ch]), dchannel_dcolor * dL_dpixel_normal[ch]);
+				// PBR albedo
+				atomicAdd(&(dL_dalbedo[global_id * C + ch]), dchannel_dcolor * dL_dpixel_albedo[ch]);
+				// Update accumulated color for next splat
+				accum_rec[ch] += c * dchannel_dcolor;
 			}
 			atomicAdd(&(dL_droughness[global_id]), dchannel_dcolor * dL_dpixel_roughness);
 			atomicAdd(&(dL_dmetallic[global_id]), dchannel_dcolor * dL_dpixel_metallic);
 			atomicAdd(&(dL_depth[global_id]), dchannel_dcolor * dL_dpixel_depth);
 
-			// NOTE: for opacity
-			accum_opacity = last_alpha + (1.f - last_alpha) * accum_opacity;
-			dL_dalpha += (1.0f - accum_opacity) * dL_dpixel_opacity;
+			// Opacity gradient contribution
+			// The accumulated opacity up to (but not including) this splat = 1 - T
+			float accum_opacity_before = 1.0f - T;
+			dL_dalpha += (1.0f - accum_opacity_before) * dL_dpixel_opacity;
 
 			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
 
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++) {
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+			// Background contribution to alpha gradient
+			float bg_dot_dpixel = 0.0f;
+			for (int ch = 0; ch < C; ch++) {
+				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
 			}
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
@@ -612,19 +595,22 @@ renderCUDA(
 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
+			// Update gradients w.r.t. 2D mean position
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 			const float abs_dL_dmean2D = abs(dL_dG * dG_ddelx * ddelx_dx) + abs(dL_dG * dG_ddely * ddely_dy);
-            atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
+			atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+			// Update gradients w.r.t. 2D covariance
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-			// Update gradients w.r.t. opacity of the Gaussian
+			// Update gradients w.r.t. opacity
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+
+			// Update T for next splat
+			T = test_T;
 		}
 	}
 }
@@ -808,72 +794,83 @@ SSRCUDA(
 }
 
 
-__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderFeatureBackwardCUDA(
+// Bucket-centric backward for feature rendering
+__global__ void
+renderFeatureBucketBackwardCUDA(
+	const int total_buckets,
 	const int W, int H,
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
+	const uint32_t* __restrict__ bucket_to_tile,
+	const uint32_t* __restrict__ bucket_offsets,
+	const float* __restrict__ sampled_T,
+	const uint32_t* __restrict__ max_contrib,
 	const float* __restrict__ dL_dpixels_feature,
 	const int feature_dim,
 	float* __restrict__ dL_dfeature)
 {
-	auto block = cg::this_thread_block();
+	const int bucket_idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (bucket_idx >= total_buckets)
+		return;
+
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	const uint32_t pix_id = W * pix.y + pix.x;
-	const float2 pixf = { (float)pix.x, (float)pix.y };
+	const uint32_t tile_id = bucket_to_tile[bucket_idx];
+	const uint32_t tile_bucket_base = (tile_id == 0) ? 0 : bucket_offsets[tile_id - 1];
+	const uint32_t bucket_in_tile = bucket_idx - tile_bucket_base;
 
-	const bool inside = pix.x < W && pix.y < H;
-	bool done = !inside;
-	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
-	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	int toDo = range.y - range.x;
+	if (bucket_in_tile * 32 >= max_contrib[tile_id])
+		return;
 
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	const uint2 range = ranges[tile_id];
+	const uint32_t splat_start = range.x + bucket_in_tile * 32;
+	const uint32_t splat_end = min(splat_start + 32u, range.y);
 
-	float T = 1.0f;
-	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE) {
-		int num_done = __syncthreads_count(done);
-		if (num_done == BLOCK_SIZE)
-			break;
+	const uint32_t tile_x = tile_id % horizontal_blocks;
+	const uint32_t tile_y = tile_id / horizontal_blocks;
+	const uint2 pix_min = { tile_x * BLOCK_X, tile_y * BLOCK_Y };
 
-		int progress = i * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y) {
-			int coll_id = point_list[range.x + progress];
-			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-		}
-		block.sync();
+	for (int pixel_local = 0; pixel_local < BLOCK_SIZE; pixel_local++)
+	{
+		const uint32_t local_x = pixel_local % BLOCK_X;
+		const uint32_t local_y = pixel_local / BLOCK_X;
+		const uint2 pix = { pix_min.x + local_x, pix_min.y + local_y };
 
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
-			float2 xy = collected_xy[j];
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+		if (pix.x >= (uint32_t)W || pix.y >= (uint32_t)H)
+			continue;
+
+		const uint32_t pix_id = W * pix.y + pix.x;
+		const float2 pixf = { (float)pix.x, (float)pix.y };
+
+		// Restore T from snapshot (feature uses same T as color)
+		const uint32_t snap_base = bucket_idx * BLOCK_SIZE + pixel_local;
+		float T = sampled_T[snap_base];
+
+		for (uint32_t s = splat_start; s < splat_end; s++)
+		{
+			const int global_id = point_list[s];
+
+			const float2 xy = points_xy_image[global_id];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = conic_opacity[global_id];
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
 			float alpha = min(0.99f, con_o.w * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
-			float test_T = T * (1 - alpha);
-			if (test_T < 0.0001f) {
-				done = true;
-				continue;
-			}
+
+			float test_T = T * (1.f - alpha);
+			if (test_T < 0.0001f)
+				break;
+
 			const float weight = alpha * T;
-			const int point_offset = collected_id[j] * feature_dim;
-			if (inside) {
-				for (int feat_ch = 0; feat_ch < feature_dim; ++feat_ch) {
-					const float dL_dpixel = dL_dpixels_feature[feat_ch * H * W + pix_id];
-					atomicAdd(&(dL_dfeature[point_offset + feat_ch]), weight * dL_dpixel);
-				}
+			const int point_offset = global_id * feature_dim;
+			for (int feat_ch = 0; feat_ch < feature_dim; ++feat_ch) {
+				const float dL_dpixel = dL_dpixels_feature[feat_ch * H * W + pix_id];
+				atomicAdd(&(dL_dfeature[point_offset + feat_ch]), weight * dL_dpixel);
 			}
 			T = test_T;
 		}
@@ -881,26 +878,39 @@ renderFeatureBackwardCUDA(
 }
 
 void BACKWARD::render_feature(
-	const dim3 grid, const dim3 block,
+	const int total_buckets,
 	const int W, int H,
 	const uint2* ranges,
 	const uint32_t* point_list,
 	const float2* means2D,
 	const float4* conic_opacity,
+	const uint32_t* bucket_to_tile,
+	const uint32_t* bucket_offsets,
+	const float* sampled_T,
+	const uint32_t* max_contrib,
 	const float* dL_dpixels_feature,
 	const int feature_dim,
 	float* dL_dfeature)
 {
-	renderFeatureBackwardCUDA<<<grid, block>>>(
-		W, H,
-		ranges,
-		point_list,
-		means2D,
-		conic_opacity,
-		dL_dpixels_feature,
-		feature_dim,
-		dL_dfeature
-	);
+	const int threads = 256;
+	const int blocks = (total_buckets + threads - 1) / threads;
+	if (blocks > 0) {
+		renderFeatureBucketBackwardCUDA<<<blocks, threads>>>(
+			total_buckets,
+			W, H,
+			ranges,
+			point_list,
+			means2D,
+			conic_opacity,
+			bucket_to_tile,
+			bucket_offsets,
+			sampled_T,
+			max_contrib,
+			dL_dpixels_feature,
+			feature_dim,
+			dL_dfeature
+		);
+	}
 }
 
 void BACKWARD::preprocess(
@@ -971,7 +981,7 @@ void BACKWARD::preprocess(
 }
 
 void BACKWARD::render(
-	const dim3 grid, const dim3 block,
+	const int total_buckets,
 	const int W, int H,
 	const float* means3D,
 	const float* cam_pos,
@@ -987,6 +997,11 @@ void BACKWARD::render(
 	const float* metallic,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
+	const uint32_t* bucket_to_tile,
+	const uint32_t* bucket_offsets,
+	const float* sampled_T,
+	const float* sampled_ar,
+	const uint32_t* max_contrib,
 	const float* dL_dpixels_depth,
 	const float* dL_dpixels,
 	const float* dL_dpixels_opacity,
@@ -1004,39 +1019,50 @@ void BACKWARD::render(
 	float* dL_droughness,
 	float* dL_dmetallic)
 {
-	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
-		W, H,
-		means3D,
-		cam_pos,
-		ranges,
-		point_list,
-		bg_color,
-		means2D,
-		conic_opacity,
-		colors,
-		normal,
-		albedo,
-		roughness,
-		metallic,
-		final_Ts,
-		n_contrib,
-		dL_dpixels_depth,
-		dL_dpixels,
-		dL_dpixels_opacity,
-		dL_dpixels_normal,
-		dL_dpixels_albedo,
-		dL_dpixels_roughness,
-		dL_dpixels_metallic,
-		dL_dmean2D,
-		dL_dconic2D,
-		dL_depth,
-		dL_dopacity,
-		dL_dcolors,
-		dL_dnormals,
-		dL_dalbedo,
-		dL_droughness,
-		dL_dmetallic
-	);
+	// Launch one thread per bucket
+	const int threads = 256;
+	const int blocks = (total_buckets + threads - 1) / threads;
+	if (blocks > 0) {
+		renderBucketCUDA<NUM_CHANNELS><<<blocks, threads>>>(
+			total_buckets,
+			W, H,
+			means3D,
+			cam_pos,
+			ranges,
+			point_list,
+			bg_color,
+			means2D,
+			conic_opacity,
+			colors,
+			normal,
+			albedo,
+			roughness,
+			metallic,
+			final_Ts,
+			n_contrib,
+			bucket_to_tile,
+			bucket_offsets,
+			sampled_T,
+			sampled_ar,
+			max_contrib,
+			dL_dpixels_depth,
+			dL_dpixels,
+			dL_dpixels_opacity,
+			dL_dpixels_normal,
+			dL_dpixels_albedo,
+			dL_dpixels_roughness,
+			dL_dpixels_metallic,
+			dL_dmean2D,
+			dL_dconic2D,
+			dL_depth,
+			dL_dopacity,
+			dL_dcolors,
+			dL_dnormals,
+			dL_dalbedo,
+			dL_droughness,
+			dL_dmetallic
+		);
+	}
 }
 
 void BACKWARD::SSR(

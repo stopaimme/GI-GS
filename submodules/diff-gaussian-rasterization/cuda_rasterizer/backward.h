@@ -23,7 +23,7 @@
 namespace BACKWARD
 {
 	void render(
-		const dim3 grid, dim3 block,
+		const int total_buckets,
 		const int W, int H,
 		const float* means3D,
 		const float* cam_pos,
@@ -39,6 +39,11 @@ namespace BACKWARD
 		const float* metallic,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
+		const uint32_t* bucket_to_tile,
+		const uint32_t* bucket_offsets,
+		const float* sampled_T,
+		const float* sampled_ar,
+		const uint32_t* max_contrib,
 		const float* dL_dpixels_depth,
 		const float* dL_dpixels,
 		const float* dL_dpixels_opacity,
@@ -57,12 +62,16 @@ namespace BACKWARD
 		float* dL_dmetallic);
 
 	void render_feature(
-		const dim3 grid, dim3 block,
+		const int total_buckets,
 		const int W, int H,
 		const uint2* ranges,
 		const uint32_t* point_list,
 		const float2* means2D,
 		const float4* conic_opacity,
+		const uint32_t* bucket_to_tile,
+		const uint32_t* bucket_offsets,
+		const float* sampled_T,
+		const uint32_t* max_contrib,
 		const float* dL_dpixels_feature,
 		const int feature_dim,
 		float* dL_dfeature);

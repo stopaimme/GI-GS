@@ -65,11 +65,41 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
-	template<typename T> 
+	struct SampleState
+	{
+		size_t scan_size;
+		uint32_t* bucket_to_tile;   // [total_buckets] maps bucket -> tile_id
+		uint32_t* bucket_offsets;   // [num_tiles] inclusive prefix sum of per-tile bucket counts
+		uint32_t* max_contrib;      // [num_tiles] per-tile max contributor index
+		float* sampled_T;           // [total_buckets * BLOCK_SIZE] snapshot of T
+		float* sampled_ar;          // [NUM_CHANNELS * total_buckets * BLOCK_SIZE] snapshot of accumulated color
+		char* scanning_space;
+
+		static SampleState fromChunk(char*& chunk, size_t total_buckets, size_t num_tiles);
+	};
+
+	template<typename T>
 	size_t required(size_t P)
 	{
 		char* size = nullptr;
 		T::fromChunk(size, P);
+		return ((size_t)size) + 128;
+	}
+
+	// Overload for SampleState which takes two size parameters
+	template<>
+	inline size_t required<SampleState>(size_t total_buckets)
+	{
+		// This is a placeholder; actual allocation uses fromChunk with both params.
+		// We compute a conservative estimate.
+		return 0;
+	}
+
+	// Helper to compute required size for SampleState
+	inline size_t requiredSampleState(size_t total_buckets, size_t num_tiles)
+	{
+		char* size = nullptr;
+		SampleState::fromChunk(size, total_buckets, num_tiles);
 		return ((size_t)size) + 128;
 	}
 };
